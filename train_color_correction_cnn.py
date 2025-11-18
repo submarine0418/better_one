@@ -1,6 +1,7 @@
 """
-CNN 色彩校正訓練腳本
+CNN 色彩校正訓練腳本（LAB 色彩空間版本）
 使用配對的原始圖像和參考圖像訓練輕量級 CNN 色彩校正模型
+在 LAB 色彩空間進行訓練
 """
 
 import os
@@ -13,14 +14,16 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 import json
+from skimage import color as skcolor
 
 from color_correction_cnn import LightweightColorCorrectionNet, ColorCorrectionTrainer
 
 
 class ColorCorrectionDataset(Dataset):
     """
-    色彩校正數據集
+    色彩校正數據集（LAB 色彩空間）
     載入配對的原始圖像（需要校正）和參考圖像（已校正）
+    內部自動轉換為 LAB 色彩空間
     """
     
     def __init__(self, input_dir, reference_dir, img_size=256, augment=True):
@@ -40,7 +43,49 @@ class ColorCorrectionDataset(Dataset):
         self.image_files = self._collect_image_pairs()
         
         print(f"找到 {len(self.image_files)} 組配對圖像")
-    
+    def ssim(self, img1, img2, window, window_size, channel, size_average=True):
+        """
+        Calculate SSIM
+        
+        Args:
+            img1, img2: Input images (B, C, H, W)
+            window: Gaussian window
+            window_size: Window size
+            channel: Number of channels
+            size_average: Whether to average the loss
+        
+        Returns:
+            SSIM value
+        """
+        # Constants (to avoid division by zero)
+        C1 = 0.01 ** 2
+        C2 = 0.03 ** 2
+        
+        # Ensure window is on the correct device
+        window = window.to(img1.device)
+        
+        # Calculate mean μ
+        mu1 = F.conv2d(img1, window, padding=window_size//2, groups=channel)
+        mu2 = F.conv2d(img2, window, padding=window_size//2, groups=channel)
+        
+        mu1_sq = mu1.pow(2)
+        mu2_sq = mu2.pow(2)
+        mu1_mu2 = mu1 * mu2
+        
+        # Calculate variance σ² and covariance σ₁₂
+        sigma1_sq = F.conv2d(img1*img1, window, padding=window_size//2, groups=channel) - mu1_sq
+        sigma2_sq = F.conv2d(img2*img2, window, padding=window_size//2, groups=channel) - mu2_sq
+        sigma12 = F.conv2d(img1*img2, window, padding=window_size//2, groups=channel) - mu1_mu2
+        
+        # SSIM formula
+        ssim_map = ((2*mu1_mu2 + C1) * (2*sigma12 + C2)) / \
+                   ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+        
+        if size_average:
+            return ssim_map.mean()
+        else:
+            return ssim_map.mean(1).mean(1).mean(1)
+        
     def _collect_image_pairs(self):
         """收集配對的圖像"""
         image_pairs = []
@@ -66,6 +111,19 @@ class ColorCorrectionDataset(Dataset):
     def __len__(self):
         return len(self.image_files)
     
+    def _rgb_to_lab_normalized(self, rgb_img):
+      
+        # RGB → LAB (scikit-image)
+        lab = skcolor.rgb2lab(rgb_img)  # L: [0, 100], a/b: [-128, 127]
+        
+        # 正規化到 [0, 1]
+        lab_normalized = np.zeros_like(lab, dtype=np.float32)
+        lab_normalized[:, :, 0] = lab[:, :, 0] / 100.0          # L: [0, 100] → [0, 1]
+        lab_normalized[:, :, 1] = (lab[:, :, 1] + 128.0) / 255.0  # a: [-128, 127] → [0, 1]
+        lab_normalized[:, :, 2] = (lab[:, :, 2] + 128.0) / 255.0  # b: [-128, 127] → [0, 1]
+        
+        return lab_normalized
+    
     def __getitem__(self, idx):
         input_path, reference_path = self.image_files[idx]
         
@@ -85,13 +143,17 @@ class ColorCorrectionDataset(Dataset):
         input_img = input_img.astype(np.float32) / 255.0
         reference_img = reference_img.astype(np.float32) / 255.0
         
-        # 數據增強
+        # 數據增強（在 RGB 空間）
         if self.augment:
             input_img, reference_img = self._augment(input_img, reference_img)
         
+        # RGB → LAB (正規化到 [0, 1])
+        input_lab = self._rgb_to_lab_normalized(input_img)
+        reference_lab = self._rgb_to_lab_normalized(reference_img)
+        
         # 轉換為 tensor (H, W, C) -> (C, H, W)
-        input_tensor = torch.from_numpy(input_img).permute(2, 0, 1)
-        reference_tensor = torch.from_numpy(reference_img).permute(2, 0, 1)
+        input_tensor = torch.from_numpy(input_lab).permute(2, 0, 1)
+        reference_tensor = torch.from_numpy(reference_lab).permute(2, 0, 1)
         
         return input_tensor, reference_tensor
     
@@ -117,12 +179,7 @@ class ColorCorrectionDataset(Dataset):
 
 
 def train_color_correction_model(args):
-    """
-    訓練色彩校正模型
-    """
-    print("=" * 80)
-    print("開始訓練 CNN 色彩校正模型")
-    print("=" * 80)
+   
     
     # 設備
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -197,6 +254,9 @@ def train_color_correction_model(args):
     print(f"總參數量: {total_params:,}")
     print(f"可訓練參數: {trainable_params:,}")
     
+    trainer.window_size = 11
+    trainer.window = create_window(trainer.window_size, 3).to(device)
+    
     # ============================================
     # 訓練循環
     # ============================================
@@ -219,13 +279,38 @@ def train_color_correction_model(args):
         train_loss = 0.0
         
         pbar = tqdm(train_loader, desc='Training')
-        for batch_idx, (input_imgs, target_imgs) in enumerate(pbar):
-            loss = trainer.train_step(input_imgs, target_imgs)
-            train_loss += loss
+        for batch_idx, (input_labs, target_labs) in enumerate(pbar):
+            # 注意：此時輸入已經是 LAB 色彩空間 [0, 1]
+            input_labs = input_labs.to(device)
+            target_labs = target_labs.to(device)
+            
+            # 訓練步驟（直接在 LAB 空間訓練）
+            trainer.model.train()
+            trainer.optimizer.zero_grad()
+            
+            # 前向傳播
+            output_labs = trainer.model(input_labs)
+            
+            # 損失函數（LAB 空間）
+            # L1 損失
+            l1_loss = trainer.l1_loss(output_labs, target_labs)
+            ssim_loss = 1 - trainer.ssim(output_labs, target_labs, window=trainer.window, window_size=trainer.window_size, channel=3)
+            # LAB 空間的色彩一致性損失
+            color_loss = trainer._lab_color_consistency_loss(output_labs, target_labs)
+            
+            # 總損失
+            loss = 0.3 * l1_loss + 0.0 * color_loss+ 0.7 * ssim_loss
+            
+            # 反向傳播
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), max_norm=1.0)
+            trainer.optimizer.step()
+            
+            train_loss += loss.item()
             
             # 更新進度條
             pbar.set_postfix({
-                'loss': f'{loss:.4f}',
+                'loss': f'{loss.item():.4f}',
                 'avg_loss': f'{train_loss/(batch_idx+1):.4f}'
             })
         
@@ -236,18 +321,24 @@ def train_color_correction_model(args):
         val_loss = 0.0
         
         with torch.no_grad():
-            for input_imgs, target_imgs in tqdm(val_loader, desc='Validation'):
-                input_imgs = input_imgs.to(device)
-                target_imgs = target_imgs.to(device)
+            for input_labs, target_labs in tqdm(val_loader, desc='Validation'):
+                input_labs = input_labs.to(device)
+                target_labs = target_labs.to(device)
                 
-                output = model(input_imgs)
-                loss = F.l1_loss(output, target_imgs)
+                output = model(input_labs)
+                
+                # 驗證損失（使用相同的損失組合）
+                l1_loss = F.l1_loss(output, target_labs)
+                color_loss = trainer._lab_color_consistency_loss(output, target_labs)
+                ssim_loss = 1 - trainer.ssim(output, target_labs, window=trainer.window, window_size=trainer.window_size, channel=3)
+                loss = 0.2 * l1_loss + 0.8 * color_loss+ 0.4 * ssim_loss
+                
                 val_loss += loss.item()
         
         avg_val_loss = val_loss / len(val_loader)
         
         # 學習率調度
-        trainer.scheduler.step()
+        trainer.scheduler.step(avg_val_loss)
         current_lr = trainer.optimizer.param_groups[0]['lr']
         
         # 記錄歷史
@@ -291,8 +382,23 @@ def train_color_correction_model(args):
     print("=" * 80)
 
 
+def create_window(window_size, channel):
+    """Create Gaussian window for SSIM"""
+    def gaussian(window_size, sigma=1.5):
+        gauss = torch.Tensor([
+            np.exp(-(x - window_size//2)**2/float(2*sigma**2)) 
+            for x in range(window_size)
+        ])
+        return gauss / gauss.sum()
+    
+    _1D_window = gaussian(window_size).unsqueeze(1)
+    _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
+    window = _2D_window.expand(channel, 1, window_size, window_size).contiguous()
+    return window
+
+
 def main():
-    parser = argparse.ArgumentParser(description='訓練 CNN 色彩校正模型')
+    parser = argparse.ArgumentParser(description='訓練 CNN 色彩校正模型（LAB 色彩空間）')
     
     # 數據相關
     parser.add_argument('--input', type=str, required=True,

@@ -99,7 +99,7 @@ class MATLABParameterPredictor(nn.Module):
         # ========================================
         self.param_ranges = {
             'omega': (0.25, 0.99),           # 去霧強度
-            'guided_radius': (5.0, 50.0),  # 引導濾波半徑
+            'guided_radius': (5.0, 15.0),  # 引導濾波半徑
             'L_low': (0.0, 15.0),          # 色彩拉伸下界
             'L_high': (95.0,100.0),        # 色彩拉伸上界
             'eps': (1e-12, 1),           # 引導濾波 epsilon

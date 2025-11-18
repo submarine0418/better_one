@@ -1,8 +1,3 @@
-"""
-MATLAB 風格水下影像增強模組 (可微分版本)
-包含: 大氣光估算、初始透射率、梯度約束、引導濾波、影像恢復、色彩拉伸
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,16 +9,10 @@ import numpy as np
 # ============================================
 
 class AtmosphericLightEstimator:
-    """
-    使用四叉樹分割的大氣光估算器
-    完全複製 MATLAB 的 find_brightest_region 函數
-    """
+    
     
     def __init__(self, min_size=1):
-        """
-        Args:
-            min_size: 最小分割區域大小
-        """
+      
         self.min_size = min_size
     
     def __call__(self, img):
@@ -247,7 +236,7 @@ class GuidedFilter(nn.Module):
         self.r = radius
         self.eps = eps
     
-    def forward(self, guide, input_map):
+    def forward(self, guide, input_map, eps=None):
         """
         引導濾波
         
@@ -262,7 +251,7 @@ class GuidedFilter(nn.Module):
         mean_I = self.box_filter(guide)
         mean_p = self.box_filter(input_map)
         mean_Ip = self.box_filter(guide * input_map)
-        
+        epsilon = eps if eps is not None else self.eps
         # 協方差
         cov_Ip = mean_Ip - mean_I * mean_p
         
@@ -271,7 +260,7 @@ class GuidedFilter(nn.Module):
         var_I = mean_II - mean_I * mean_I
         
         # 計算線性係數
-        a = cov_Ip / (var_I + self.eps)
+        a = cov_Ip / (var_I + epsilon) # (B, 1, H, W)
         b = mean_p - a * mean_I
         
         # 再次平均
@@ -364,7 +353,7 @@ class MATLABStyleEnhancement(nn.Module):
         # ========================================
         # 由於每張圖的 radius 可能不同，需要逐張處理
         t_final = self.guided_filter_batch(
-            img, t_gradient, params['guided_radius']
+            img, t_gradient, params['guided_radius'], params['eps']
         )
         
         # 限制透射率範圍
@@ -450,7 +439,7 @@ class MATLABStyleEnhancement(nn.Module):
     
     
     
-    def guided_filter_batch(self, img, t, guided_radius):
+    def guided_filter_batch(self, img, t, guided_radius, guide_eps):
         """
         批次引導濾波（處理不同 radius）
         
@@ -458,7 +447,7 @@ class MATLABStyleEnhancement(nn.Module):
             img: (B, 3, H, W)
             t: (B, 1, H, W)
             guided_radius: (B, 1) 每張圖的濾波半徑
-        
+            guide_eps: (B, 1) 每張圖的正則化參數
         Returns:
             t_filtered: (B, 1, H, W)
         """
@@ -472,16 +461,16 @@ class MATLABStyleEnhancement(nn.Module):
         for b in range(B):
             radius = int(guided_radius[b].item())
             radius = max(1, min(radius, 50))  # 限制範圍 [1, 50]
-            
+            eps_value = guide_eps[b].item()
             # 創建引導濾波器
-            guided_filter = GuidedFilter(radius=radius, eps=5e-1)
+            guided_filter = GuidedFilter(radius=radius, eps = eps_value)
             
             # 單張處理
             # clone 切片以避免 view 導致的原地版本衝突
             guide_single = img_gray[b:b+1]  # 已是 view
             t_single = t[b:b+1]
             
-            t_filtered_single = guided_filter(guide_single, t_single)
+            t_filtered_single = guided_filter(guide_single, t_single, eps=eps_value)
             t_filtered_list.append(t_filtered_single)
         
         # 拼接回 batch
@@ -581,6 +570,7 @@ if __name__ == '__main__':
        'guided_radius': torch.tensor([[15.0]]),  # 引導濾波半徑
        'L_low': torch.tensor([[15.0]]),          # 色彩拉伸下界
        'L_high': torch.tensor([[95.0]]),         # 色彩拉伸上界
+       'eps': torch.tensor([[0.5]]),            # 引導濾波正則化參數
    }
    
    # 增強圖像

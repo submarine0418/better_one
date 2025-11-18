@@ -25,7 +25,7 @@ from color_correction import ColorCorrection
 from matlab_style_enhancement import AtmosphericLightEstimator, MATLABStyleEnhancement
 from parameter_predictor import MATLABParameterPredictor
 from color_correction_cnn import ColorCorrectionCNN
-
+from airlight_CNN import make_atmospheric_light_cnn  
 # ============================================
 # 數據集（帶預處理）
 # ============================================
@@ -44,6 +44,7 @@ class MATLABStyleDataset(Dataset):
             target_size: 目標大小
             augment: 是否數據增強
             use_features: 是否使用統計特徵
+            atmos_model_path: 大氣光模型路徑
         """
         self.image_folder = Path(image_folder)
         self.reference_folder = Path(reference_folder)
@@ -52,7 +53,10 @@ class MATLABStyleDataset(Dataset):
         self.use_features = use_features
         
         # 色偏校正器
-        self.color_corrector = ColorCorrectionCNN()
+        self.color_corrector = ColorCorrectionCNN(
+            model_path=r"D:\research\better_one\color_correction_output\best_color_correction_model.pth",
+            device='cuda'
+        )
         
         # 大氣光估算器
         self.atmos_estimator = AtmosphericLightEstimator(min_size=1)
@@ -79,7 +83,7 @@ class MATLABStyleDataset(Dataset):
         return len(self.image_paths)
     
     def load_image(self, path, target_size):
-        """載入並調整圖像大小"""
+    
         img = cv2.imread(str(path))
         if img is None:
             raise ValueError(f"Failed to load image: {path}")
@@ -91,7 +95,7 @@ class MATLABStyleDataset(Dataset):
         return img
     
     def augment_pair(self, img, ref):
-        """數據增強（水平/垂直翻轉）"""
+        
         if np.random.rand() > 0.5:
             img = np.fliplr(img).copy()
             ref = np.fliplr(ref).copy()
@@ -105,7 +109,7 @@ class MATLABStyleDataset(Dataset):
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
         
-        # 載入原始圖像（不調整大小，用於色偏校正和大氣光估算）
+        # Load original image (no resizing, used for color correction and airlight estimation)
         img_original_cv = cv2.imread(str(img_path))
         if img_original_cv is None:
             raise ValueError(f"Failed to load image: {img_path}")
@@ -113,51 +117,51 @@ class MATLABStyleDataset(Dataset):
         
       
         
-        # 1. 色偏校正
+        # 1. color correction
         img_corrected, color_type = self.color_corrector(img_original_cv)
         
-        # 2. 大氣光估算
+        # 2. airlight
         atmospheric_light = self.atmos_estimator(img_corrected)
 
-        # 調整校正後的圖像到目標大小
+        # Resize corrected image to target size
         img_corrected_resized = cv2.resize(
             (img_corrected * 255).astype(np.uint8), 
             (self.target_size, self.target_size),
             interpolation=cv2.INTER_LINEAR
         ).astype(np.float32) / 255.0
         
-        # 載入參考圖像
+        # Load reference image
         ref_path = self.reference_folder / img_path.name
         if ref_path.exists():
             ref = self.load_image(ref_path, self.target_size)
         else:
-            # 如果沒有參考圖，使用原圖
+            # If no reference image, use original image
             ref = cv2.resize(img_original_cv, (self.target_size, self.target_size),
                            interpolation=cv2.INTER_LINEAR)
         
         # ========================================
-        # 數據增強
+        # Data augmentation
         # ========================================
         if self.augment:
             img_corrected_resized, ref = self.augment_pair(img_corrected_resized, ref)
         
         # ========================================
-        # 轉換為 Tensor
+        # Convert to Tensor
         # ========================================
         
-        # 1. 用於增強的圖像（原始尺度）
+        # 1. Image for augmentation (original scale)
         img_tensor = torch.from_numpy(img_corrected_resized).permute(2, 0, 1).float()
         
-        # 2. 用於 VGG 的圖像（VGG 歸一化）
+        # 2. Image for VGG (VGG normalization)
         img_vgg = self.normalize(img_tensor.clone())
         
-        # 3. 參考圖像 
+        # 3. Reference image 
         ref_tensor = torch.from_numpy(ref).permute(2, 0, 1).float()
         
-        # 4. 大氣光
+        # 4. Atmospheric light
         atmos_tensor = torch.from_numpy(atmospheric_light).float()
         
-        # 5. 統計特徵
+        # 5. Statistical features(no use)
         # if self.use_features:
         #     features = extract_statistical_features(img_corrected_resized)
         #     feature_tensor = torch.from_numpy(features).float()
@@ -165,18 +169,18 @@ class MATLABStyleDataset(Dataset):
         feature_tensor = torch.zeros(79).float()
         
         return {
-            'image': img_tensor,              # (3, H, W) 用於增強，[0, 1]
-            'image_vgg': img_vgg,             # (3, H, W) 用於 VGG，已歸一化
-            'reference': ref_tensor,          # (3, H, W) 參考圖像
-            'atmospheric_light': atmos_tensor,  # (3,) 大氣光
-            'features': feature_tensor,       # (79,) 統計特徵
-            'color_type': color_type,         # str 色偏類型
+            'image': img_tensor,              # (3, H, W) for augmentation, [0, 1]
+            'image_vgg': img_vgg,             # (3, H, W) for VGG, normalized
+            'reference': ref_tensor,          # (3, H, W) reference image
+            'atmospheric_light': atmos_tensor,  # (3,) atmospheric light
+            'features': feature_tensor,       # (79,) statistical features
+            'color_type': color_type,         # str color bias type
             'path': str(img_path)
         }
 
 
 # ============================================
-# 損失函數
+# Loss Functions
 # ============================================
 class SSIMLoss(nn.Module):
     """
@@ -193,19 +197,19 @@ class SSIMLoss(nn.Module):
         """
         Args:
             window_size: (default: 11)
-            size_average: 是否取平均 (default: True)
-            channel: 圖像通道數 (default: 3 for RGB)
+            size_average: whether to average the loss (default: True)
+            channel: number of image channels (default: 3 for RGB)
         """
         super(SSIMLoss, self).__init__()
         self.window_size = window_size
         self.size_average = size_average
         self.channel = channel
         
-        # 創建高斯窗口
+        # Create Gaussian window
         self.window = self.create_window(window_size, channel)
     
     def gaussian(self, window_size, sigma=1.5):
-        """創建 1D 高斯核"""
+        """Create 1D Gaussian kernel"""
         gauss = torch.Tensor([
             torch.exp(torch.tensor(-(x - window_size//2)**2 / float(2*sigma**2)))
             for x in range(window_size)
@@ -213,7 +217,7 @@ class SSIMLoss(nn.Module):
         return gauss / gauss.sum()
     
     def create_window(self, window_size, channel):
-        """創建 2D 高斯窗口"""
+        """Create 2D Gaussian window"""
         _1D_window = self.gaussian(window_size).unsqueeze(1)
         _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
         window = _2D_window.expand(channel, 1, window_size, window_size).contiguous()
@@ -221,26 +225,26 @@ class SSIMLoss(nn.Module):
     
     def ssim(self, img1, img2, window, window_size, channel, size_average=True):
         """
-        計算 SSIM
+        Calculate SSIM
         
         Args:
-            img1, img2: 輸入圖像 (B, C, H, W)
-            window: 高斯窗口
-            window_size: 窗口大小
-            channel: 通道數
-            size_average: 是否取平均
+            img1, img2: Input images (B, C, H, W)
+            window: Gaussian window
+            window_size: Window size
+            channel: Number of channels
+            size_average: Whether to average the loss
         
         Returns:
-            SSIM 值 (0-1, 越大越相似)
+            SSIM value
         """
-        # 常數 (避免除零)
+        # Constants (to avoid division by zero)
         C1 = 0.01 ** 2
         C2 = 0.03 ** 2
         
-        # 確保 window 在正確的設備上
+        # Ensure window is on the correct device
         window = window.to(img1.device)
         
-        # 計算均值 μ
+        # Calculate mean μ
         mu1 = F.conv2d(img1, window, padding=window_size//2, groups=channel)
         mu2 = F.conv2d(img2, window, padding=window_size//2, groups=channel)
         
@@ -248,12 +252,12 @@ class SSIMLoss(nn.Module):
         mu2_sq = mu2.pow(2)
         mu1_mu2 = mu1 * mu2
         
-        # 計算方差 σ² 和協方差 σ₁₂
+        # Calculate variance σ² and covariance σ₁₂
         sigma1_sq = F.conv2d(img1*img1, window, padding=window_size//2, groups=channel) - mu1_sq
         sigma2_sq = F.conv2d(img2*img2, window, padding=window_size//2, groups=channel) - mu2_sq
         sigma12 = F.conv2d(img1*img2, window, padding=window_size//2, groups=channel) - mu1_mu2
         
-        # SSIM 公式
+        # SSIM formula
         ssim_map = ((2*mu1_mu2 + C1) * (2*sigma12 + C2)) / \
                    ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
         
@@ -268,7 +272,7 @@ class SSIMLoss(nn.Module):
             img1, img2: (B, C, H, W) tensors, 值域 [0, 1]
         
         Returns:
-            loss: 1 - SSIM (越小越好)
+            loss: 1 - SSIM 
         """
         (_, channel, _, _) = img1.size()
         
@@ -282,7 +286,7 @@ class SSIMLoss(nn.Module):
         
         ssim_value = self.ssim(img1, img2, window, self.window_size, channel, self.size_average)
         
-        # 返回 loss (1 - SSIM)
+        # Return loss (1 - SSIM)
         return 1 - ssim_value
 
 class PerceptualLoss(nn.Module):
@@ -334,11 +338,11 @@ class FullSSIMCombinedLoss(nn.Module):
         }
 
 # ============================================
-# 訓練器
+# Trainer
 # ============================================
 
 class MATLABStyleTrainer:
-    """ 風格增強訓練器"""
+   
     
     def __init__(self, device='cuda', use_amp=True):
         """
@@ -359,32 +363,32 @@ class MATLABStyleTrainer:
         self.enhancement = MATLABStyleEnhancement().to(device)
         self.criterion = FullSSIMCombinedLoss(device=device)
         
-        # 優化器
+        # Optimizer
         self.optimizer = optim.AdamW(
             self.param_predictor.parameters(),
             lr=1e-4,
             weight_decay=1e-5
         )
         
-        # 學習率調度器
+        # Learning rate scheduler
         self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
             self.optimizer, T_0=10, T_mult=2
         )
         
-        # 混合精度
+        # Mixed precision
         if self.use_amp:
             self.scaler = torch.amp.GradScaler('cuda')
         else:
             self.scaler = None
-        
-        # 記錄
+
+        # Records
         self.train_losses = []
         self.val_losses = []
     
     def train_epoch(self, dataloader, epoch):
-        """訓練一個 epoch"""
+        """Train for one epoch"""
         self.param_predictor.train()
-        self.enhancement.eval()  # 增強模組不訓練
+        self.enhancement.eval()  # Enhancement module not trained
         
         total_loss = 0
         loss_components = {'ssim': 0, 'l1': 0}
@@ -392,7 +396,7 @@ class MATLABStyleTrainer:
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
         
         for batch_idx, batch in enumerate(pbar):
-            # 取得數據
+            # Get data
             images = batch['image'].to(self.device)               # (B, 3, H, W)
             images_vgg = batch['image_vgg'].to(self.device)       # (B, 3, H, W)
             references = batch['reference'].to(self.device)       # (B, 3, H, W)
@@ -401,16 +405,16 @@ class MATLABStyleTrainer:
             
             self.optimizer.zero_grad()
             
-            # 混合精度訓練
+            # Mixed precision training
             if self.use_amp:
                 with torch.amp.autocast('cuda'):
-                    # 預測參數
+                    # Predict parameters
                     params = self.param_predictor(images_vgg, features)
                     
-                    # 應用增強
+                    # Apply enhancement
                     enhanced, _ = self.enhancement(images, params, atmos_light)
                     
-                    # 計算損失
+                    # Calculate loss
                     loss, components = self.criterion(enhanced, references)
                 
                 self.scaler.scale(loss).backward()
@@ -419,7 +423,7 @@ class MATLABStyleTrainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                # 標準訓練
+                # Standard training
                 params = self.param_predictor(images_vgg, features)
                 enhanced, _ = self.enhancement(images, params, atmos_light)
                 loss, components = self.criterion(enhanced, references)
@@ -428,12 +432,12 @@ class MATLABStyleTrainer:
                 torch.nn.utils.clip_grad_norm_(self.param_predictor.parameters(), 1.0)
                 self.optimizer.step()
             
-            # 更新統計
+            # Update statistics
             total_loss += loss.item()
             for k, v in components.items():
                 loss_components[k] += v
             
-            # 更新進度條
+            # update progress bar
             pbar.set_postfix({
                 'loss': f'{loss.item():.4f}',
                 'lr': f'{self.optimizer.param_groups[0]["lr"]:.6f}'
@@ -476,7 +480,7 @@ class MATLABStyleTrainer:
         return avg_loss, avg_components
     
     def save(self, path, epoch=None, metrics=None):
-        """保存檢查點"""
+        """Save checkpoint"""
         checkpoint = {
             'model_state_dict': self.param_predictor.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
@@ -494,7 +498,7 @@ class MATLABStyleTrainer:
         print(f"✓ Checkpoint saved: {path}")
     
     def load(self, path):
-        """載入檢查點"""
+        """Load checkpoint"""
         checkpoint = torch.load(path, map_location=self.device)
         self.param_predictor.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -505,7 +509,7 @@ class MATLABStyleTrainer:
 
 
 # ============================================
-# 主訓練函數
+# Main training function
 # ============================================
 
 def train_matlab_style(image_folder, reference_folder, output_folder,
@@ -539,15 +543,15 @@ def train_matlab_style(image_folder, reference_folder, output_folder,
     # 創建輸出目錄
     Path(output_folder).mkdir(parents=True, exist_ok=True)
 
-    # 啟用 Autograd anomaly detection（調試用，當定位到問題後可移除）
+    # Enable Autograd anomaly detection (for debugging, remove after locating issues)
     # try:
     #     # torch.autograd.set_detect_anomaly(True)
     # except Exception:
-    #     # 如果跑在沒有 torch.autograd 的環境，忽略
+    #     # If running in an environment without torch.autograd, ignore
     #     pass
 
     print("=" * 80)
-    print("MATLAB 風格水下影像增強訓練")
+    print(" Underwater Image Enhancement Training")
     print("=" * 80)
     print(f"Device: {device}")
     print(f"Mixed Precision: {use_amp}")
@@ -578,8 +582,8 @@ def train_matlab_style(image_folder, reference_folder, output_folder,
             generator=torch.Generator().manual_seed(42)
         )
         
-        # 創建數據載入器
-        # Windows 系統需要 num_workers=0 避免序列化問題
+        # Create data loaders
+        # Windows requires num_workers=0 to avoid serialization issues
         import platform
         num_workers = 0 if platform.system() == 'Windows' else 2
         
@@ -600,27 +604,27 @@ def train_matlab_style(image_folder, reference_folder, output_folder,
             pin_memory=False
         )
         
-        print(f"訓練樣本: {len(train_subset)}")
-        print(f"驗證樣本: {len(val_subset)}")
+        print(f"Training samples: {len(train_subset)}")
+        print(f"Validation samples: {len(val_subset)}")
         
-        # 初始化訓練器
-        print("\n初始化訓練器...")
+        # Initialize trainer
+        print("\nInitializing trainer...")
         trainer = MATLABStyleTrainer(device=device, use_amp=use_amp)
         
-        # 恢復訓練
+        # Resume training
         start_epoch = 0
         if resume and Path(resume).exists():
-            print(f"恢復訓練: {resume}")
+            print(f"Resuming training: {resume}")
             trainer.load(resume)
             start_epoch = len(trainer.train_losses)
         
-        # 訓練循環
+        # Training loop
         best_val_loss = float('inf')
         patience_counter = 0
         max_patience = 15
         
         print("\n" + "=" * 80)
-        print("開始訓練")
+        print("Starting Training")
         print("=" * 80)
         
         for epoch in range(start_epoch, epochs):
@@ -656,35 +660,35 @@ def train_matlab_style(image_folder, reference_folder, output_folder,
                     epoch=epoch + 1,
                     metrics={'val_loss': val_loss}
                 )
-                print(f"✓ 新的最佳模型! Val Loss: {val_loss:.6f}")
+                print(f"✓ New best model! Val Loss: {val_loss:.6f}")
             else:
                 patience_counter += 1
                 print(f"Patience: {patience_counter}/{max_patience}")
             
-            # 定期保存
+            # Periodic saving
             if (epoch + 1) % 10 == 0:
                 trainer.save(f"{output_folder}/checkpoint_epoch_{epoch + 1}.pth")
             
-            # 早停
+            # Early stopping
             if patience_counter >= max_patience:
-                print(f"\n早停於 epoch {epoch + 1}")
+                print(f"\nEarly stopping at epoch {epoch + 1}")
                 break
             
-            # 清理 GPU 記憶體
+            # Clear GPU memory
             if device == 'cuda':
                 torch.cuda.empty_cache()
         
-        # 保存最終模型
+        # Save final model
         trainer.save(f"{output_folder}/final_model.pth")
         print("\n" + "=" * 80)
-        print("訓練完成!")
+        print("Training completed!")
         print(f"Best Val Loss: {best_val_loss:.6f}")
-        print(f"模型保存於: {output_folder}")
+        print(f"Model saved at: {output_folder}")
         print("=" * 80)
     
     except KeyboardInterrupt:
-        print("\n\n訓練中斷")
-        print("保存當前狀態...")
+        print("\n\nTraining interrupted")
+        print("Saving current state...")
         trainer.save(f"{output_folder}/interrupted_checkpoint.pth")
     
     except Exception as e:
@@ -705,18 +709,18 @@ if __name__ == '__main__':
     import argparse
     
     parser = argparse.ArgumentParser(
-        description='MATLAB 風格水下影像增強訓練',
+        description='underwater image enhancement training',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
-    parser.add_argument('--input', required=True, help='輸入圖像資料夾')
-    parser.add_argument('--reference', required=True, help='參考圖像資料夾')
-    parser.add_argument('--output', default='./output_matlab', help='輸出資料夾')
-    parser.add_argument('--epochs', type=int, default=50, help='訓練輪數')
-    parser.add_argument('--batch-size', type=int, default=4, help='批次大小')
-    parser.add_argument('--device', default='cuda', choices=['cuda', 'cpu'], help='設備')
-    parser.add_argument('--no-amp', action='store_true', help='禁用混合精度訓練')
-    parser.add_argument('--resume', type=str, default=None, help='恢復訓練的檢查點')
+    parser.add_argument('--input', required=True, help='input image folder')
+    parser.add_argument('--reference', required=True, help='reference image folder')
+    parser.add_argument('--output', default='./output_matlab', help='output folder')
+    parser.add_argument('--epochs', type=int, default=50, help='number of epochs')
+    parser.add_argument('--batch-size', type=int, default=4, help='batch size')
+    parser.add_argument('--device', default='cuda', choices=['cuda', 'cpu'], help='device')
+    parser.add_argument('--no-amp', action='store_true', help='disable mixed precision training')
+    parser.add_argument('--resume', type=str, default=None, help='checkpoint to resume training from')
     
     args = parser.parse_args()
     

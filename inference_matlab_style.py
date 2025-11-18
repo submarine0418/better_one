@@ -12,26 +12,25 @@ import numpy as np
 from pathlib import Path
 import torchvision.transforms as T
 
+import logging
+from datetime import datetime
+logger = logging.getLogger("MATLABStylePredictor")
+
 # 導入模組
 from color_correction import ColorCorrection
 from matlab_style_enhancement import AtmosphericLightEstimator, MATLABStyleEnhancement
-from parameter_predictor import MATLABParameterPredictor, extract_statistical_features
+from parameter_predictor import MATLABParameterPredictor
 from color_correction_cnn import ColorCorrectionCNN
 
 class MATLABStylePredictor:
     """MATLAB 風格增強預測器"""
     
     def __init__(self, model_path, device='cuda', input_size=224):
-        """
-        Args:
-            model_path: 模型檔案路徑
-            device: 'cuda' or 'cpu'
-            input_size: VGG 輸入大小
-        """
+      
         self.device = device if (device == 'cuda' and torch.cuda.is_available()) else 'cpu'
         self.input_size = input_size
         
-        print(f"載入模型: {model_path}  (device={self.device})")
+        logger.info(f"載入模型: {model_path}  (device={self.device})")
         
         # 載入參數預測器
         self.param_predictor = MATLABParameterPredictor(
@@ -49,7 +48,7 @@ class MATLABStylePredictor:
         self.enhancement = MATLABStyleEnhancement().to(self.device).eval()
         
         # 預處理模組
-        # self.color_corrector = ColorCorrection()
+        self.color_corrector = ColorCorrection()
         self.color_corrector = ColorCorrectionCNN(model_path='D:\research\better_one\color_correction_output\best_color_correction_model.pth', device='cuda')
         self.atmos_estimator = AtmosphericLightEstimator(min_size=1)
         
@@ -59,7 +58,7 @@ class MATLABStylePredictor:
             std=[0.229, 0.224, 0.225]
         )
         
-        print("✓ 模型與增強模組已載入")
+        logger.info("✓ 模型與增強模組已載入")
     
     def preprocess(self, img):
         """
@@ -82,16 +81,7 @@ class MATLABStylePredictor:
         return img_corrected, atmospheric_light, color_type
     
     def predict_parameters(self, img, features):
-        """
-        預測參數
-        
-        Args:
-            img: (H, W, 3) RGB [0, 1]
-            features: (79,) numpy array
-        
-        Returns:
-            params: dict
-        """
+       
         # 調整大小到 VGG 輸入
         img_resized = cv2.resize(
             (img * 255).astype(np.uint8), 
@@ -117,17 +107,7 @@ class MATLABStylePredictor:
         return params
     
     def enhance_image(self, img, atmospheric_light, params):
-        """
-        增強圖像
         
-        Args:
-            img: (H, W, 3) RGB [0, 1]
-            atmospheric_light: (3,) numpy array
-            params: dict of tensors
-        
-        Returns:
-            enhanced: (H, W, 3) RGB [0, 1]
-        """
         # 轉換為 Tensor
         img_tensor = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(self.device)
         atmos_tensor = torch.from_numpy(atmospheric_light).unsqueeze(0).to(self.device)
@@ -150,18 +130,7 @@ class MATLABStylePredictor:
         return enhanced
     
     def process_single_image(self, input_path, output_path=None, show_params=True):
-        """
-        處理單張圖像
-        
-        Args:
-            input_path: 輸入圖像路徑
-            output_path: 輸出圖像路徑
-            show_params: 是否顯示參數
-        
-        Returns:
-            enhanced: (H, W, 3) RGB [0, 1]
-            params: dict
-        """
+      
         input_path = Path(input_path)
         
         # 讀取圖像
@@ -172,27 +141,27 @@ class MATLABStylePredictor:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         
         # 預處理
-        print("步驟 1/4: 色偏校正與大氣光估算...")
-        img_corrected, atmospheric_light, color_type = self.preprocess(img)
-        print(f"  檢測到的色偏類型: {color_type}")
-        print(f"  大氣光值: R={atmospheric_light[0]:.4f}, "
-              f"G={atmospheric_light[1]:.4f}, B={atmospheric_light[2]:.4f}")
         
-        # 提取特徵
-        print("步驟 2/4: 提取統計特徵...")
-        features = extract_statistical_features(img_corrected)
+        img_corrected, atmospheric_light, color_type = self.preprocess(img)
+        logger.info(f"  color_type: {color_type}")
+        logger.info(
+            f"  atmospheric_light: R={atmospheric_light[0]:.4f}, "
+            f"G={atmospheric_light[1]:.4f}, B={atmospheric_light[2]:.4f}"
+        )
+        
+        features = np.zeros(79, dtype=np.float32)
         
         # 預測參數
-        print("步驟 3/4: 預測增強參數...")
+        
         params = self.predict_parameters(img_corrected, features)
         
         if show_params:
-            print("  預測的參數:")
+            logger.info("  預測的參數:")
             for k, v in params.items():
-                print(f"    {k}: {v.item():.4f}")
+                logger.info(f"    {k}: {v.item():.4f}")
         
         # 增強圖像
-        print("步驟 4/4: 應用增強...")
+        
         enhanced = self.enhance_image(img_corrected, atmospheric_light, params)
         
         # 保存結果
@@ -209,23 +178,16 @@ class MATLABStylePredictor:
         enhanced_uint8 = (np.clip(enhanced, 0, 1) * 255).astype(np.uint8)
         enhanced_bgr = cv2.cvtColor(enhanced_uint8, cv2.COLOR_RGB2BGR)
         cv2.imwrite(str(output_path), enhanced_bgr)
-        print(f"✓ 儲存: {output_path}")
+        logger.info(f"✓ 儲存: {output_path}")
         
         return enhanced, params
     
     def process_folder(self, input_folder, output_folder , show_params=True):
-        """
-        批量處理資料夾
-        
-        Args:
-            input_folder: 輸入資料夾
-            output_folder: 輸出資料夾
-        """
         input_path = Path(input_folder)
         output_path = Path(output_folder)
         output_path.mkdir(parents=True, exist_ok=True)
         
-        # 找到所有圖像
+    
         image_files = (
             list(input_path.glob('*.png')) + 
             list(input_path.glob('*.jpg')) + 
@@ -233,23 +195,23 @@ class MATLABStylePredictor:
         )
         
         if not image_files:
-            print("找不到任何影像檔案！")
+            logger.warning("找不到任何影像檔案！")
             return
         
-        print(f"\n找到 {len(image_files)} 張圖像")
+        logger.info(f"\n找到 {len(image_files)} 張圖像")
         
         for i, img_path in enumerate(image_files, 1):
-            print(f"\n[{i}/{len(image_files)}] 處理: {img_path.name}")
-            print("-" * 60)
+            logger.info(f"\n[{i}/{len(image_files)}] 處理: {img_path.name}")
+            logger.info("-" * 60)
             try:
-                out_file = output_path / f"{img_path.stem}_enhanced.png"
-                self.process_single_image(
-                    str(img_path), 
-                    str(out_file), 
-                    show_params=show_params
-                )
+                 out_file = output_path / f"{img_path.stem}_enhanced.png"
+                 self.process_single_image(
+                     str(img_path), 
+                     str(out_file), 
+                     show_params=show_params
+                 )
             except Exception as e:
-                print(f"  ✗ 失敗: {e}")
+                 logger.error(f"  ✗ 失敗: {e}", exc_info=True)
         
 
 # ============================================
@@ -262,27 +224,46 @@ if __name__ == '__main__':
     )
     
     parser.add_argument('--input', type=str, required=True, 
-                       help='輸入影像或資料夾')
+                       help='input file or folder')
     parser.add_argument('--output', type=str, required=True, 
-                       help='輸出檔案或資料夾')
+                       help='output file or folder')
     parser.add_argument('--model', type=str, required=True, 
-                       help='模型檔案（checkpoint）')
+                       help='model (checkpoint)')
     parser.add_argument('--device', type=str, default='cuda', 
-                       choices=['cuda', 'cpu'], help='設備')
+                       choices=['cuda', 'cpu'], help='device')
     
     args = parser.parse_args()
     
-    # 初始化預測器
+    # 設定 logging：輸出到 console 與 output folder 下的 log 檔
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = Path(args.output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log_path = out_dir / f"run_{timestamp}.log"
+
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    fh = logging.FileHandler(str(log_path), encoding='utf-8')
+    fh.setFormatter(formatter)
+    sh = logging.StreamHandler()
+    sh.setFormatter(formatter)
+
+    logger.setLevel(logging.INFO)
+    # 移除預設 handlers（以避免重複）
+    if logger.hasHandlers():
+        logger.handlers.clear()
+    logger.addHandler(fh)
+    logger.addHandler(sh)
+
+    logger.info(f"Logging to {log_path}")
+    
     predictor = MATLABStylePredictor(
         model_path=args.model, 
         device=args.device
     )
     
-    # 處理
     input_path = Path(args.input)
     if input_path.is_file():
         predictor.process_single_image(args.input, args.output)
     elif input_path.is_dir():
         predictor.process_folder(args.input, args.output)
     else:
-        raise ValueError("輸入路徑不存在或不是檔案/資料夾")
+        raise ValueError("Input path does not exist or is not a file/folder")
