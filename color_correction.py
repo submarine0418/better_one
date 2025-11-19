@@ -1,7 +1,3 @@
-"""
-色偏校正模組 (Color Correction Module)
-完全複製 MATLAB 的 ImageColorCorrection 函數邏輯
-"""
 
 import numpy as np
 from skimage import color
@@ -29,16 +25,7 @@ class ColorCorrection:
         return img
     
     def __call__(self, img):
-        """
-        主要接口函數
-        
-        Args:
-            img: numpy array, shape (H, W, 3), RGB, [0, 255] uint8 或 [0, 1] float
-        
-        Returns:
-            corrected_img: numpy array, shape (H, W, 3), RGB, [0, 1] float
-            color_type: str, 色偏類型
-        """
+       
         # 確保輸入是 float [0, 1]
         if img.dtype == np.uint8:
             img = img.astype(np.float32) / 255.0

@@ -20,11 +20,7 @@ from color_correction_cnn import LightweightColorCorrectionNet, ColorCorrectionT
 
 
 class ColorCorrectionDataset(Dataset):
-    """
-    色彩校正數據集（LAB 色彩空間）
-    載入配對的原始圖像（需要校正）和參考圖像（已校正）
-    內部自動轉換為 LAB 色彩空間
-    """
+   
     
     def __init__(self, input_dir, reference_dir, img_size=256, augment=True):
         """
@@ -296,10 +292,10 @@ def train_color_correction_model(args):
             l1_loss = trainer.l1_loss(output_labs, target_labs)
             ssim_loss = 1 - trainer.ssim(output_labs, target_labs, window=trainer.window, window_size=trainer.window_size, channel=3)
             # LAB 空間的色彩一致性損失
-            color_loss = trainer._lab_color_consistency_loss(output_labs, target_labs)
+           
             
             # 總損失
-            loss = 0.3 * l1_loss + 0.0 * color_loss+ 0.7 * ssim_loss
+            loss = 0.3 * l1_loss + 0.7 * ssim_loss
             
             # 反向傳播
             loss.backward()
@@ -331,7 +327,7 @@ def train_color_correction_model(args):
                 l1_loss = F.l1_loss(output, target_labs)
                 color_loss = trainer._lab_color_consistency_loss(output, target_labs)
                 ssim_loss = 1 - trainer.ssim(output, target_labs, window=trainer.window, window_size=trainer.window_size, channel=3)
-                loss = 0.2 * l1_loss + 0.8 * color_loss+ 0.4 * ssim_loss
+                loss = 0.3 * l1_loss + 0.7 * ssim_loss
                 
                 val_loss += loss.item()
         

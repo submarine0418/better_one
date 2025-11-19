@@ -1,8 +1,3 @@
-"""
-輕量級 CNN 色彩校正模組 (Lightweight CNN Color Correction Module)
-使用 scikit-image 在 LAB 色彩空間進行可微分的深度學習色彩校正
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,14 +15,14 @@ class LightweightColorCorrectionNet(nn.Module):
     def __init__(self, base_channels=16):
         super().__init__()
         
-        # 第一層：淺層特徵提取
+        
         self.conv1 = nn.Sequential(
             nn.Conv2d(3, base_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(base_channels),
             nn.ReLU(inplace=True)
         )
         
-        # 第二層：中層特徵處理（深度可分離卷積）
+        
         self.conv2 = nn.Sequential(
             nn.Conv2d(base_channels, base_channels, kernel_size=3, padding=1, 
                      groups=base_channels, bias=False),
@@ -36,32 +31,20 @@ class LightweightColorCorrectionNet(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        # 第三層：細節保留
+        
         self.conv3 = nn.Sequential(
             nn.Conv2d(base_channels * 2, base_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(base_channels),
             nn.ReLU(inplace=True)
         )
         
-        # 輸出層：色彩校正映射
+        
         self.conv_out = nn.Conv2d(base_channels, 3, kernel_size=1, bias=True)
         
-        # 殘差權重（可學習）
         self.residual_weight = nn.Parameter(torch.tensor(0.5))
         
     def forward(self, x):
-        """
-        前向傳播（在 LAB 空間）
-        
-        Args:
-            x: (B, 3, H, W) LAB 圖像，已正規化到 [0, 1]
-               L: [0, 1] (對應原始 [0, 100])
-               a: [0, 1] (對應原始 [-128, 127]，中心 0.5)
-               b: [0, 1] (對應原始 [-128, 127]，中心 0.5)
-        
-        Returns:
-            corrected: (B, 3, H, W) LAB 圖像 [0, 1]
-        """
+    
         identity = x  # 保存原圖用於殘差連接
         
         # 特徵提取與處理
@@ -71,7 +54,10 @@ class LightweightColorCorrectionNet(nn.Module):
         
         # 生成校正映射（不使用 sigmoid，因為 LAB 範圍不同）
         correction = self.conv_out(x)
-        
+         
+        correction_ab = correction[:, 1:3, :, :]  # a, b 通道
+        correction_ab = torch.tanh(correction_ab) * 0.3  # 限制修正幅度
+        correction[:, 1:3, :, :] = correction_ab
         # 殘差連接
         alpha = torch.sigmoid(self.residual_weight)
         corrected = identity + alpha * correction
@@ -81,19 +67,10 @@ class LightweightColorCorrectionNet(nn.Module):
 
 
 class ColorCorrectionCNN:
-    """
-    CNN 色彩校正接口（使用 scikit-image 在 LAB 空間）
-    """
+    
     
     def __init__(self, model_path=None, device='cuda', base_channels=16):
-        """
-        初始化
-        
-        Args:
-            model_path: 預訓練模型路徑
-            device: 'cuda' 或 'cpu'
-            base_channels: 網路基礎通道數
-        """
+      
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         
         # 初始化網路
@@ -168,18 +145,7 @@ class ColorCorrectionCNN:
         return corrected_rgb, color_type
     
     def _normalize_lab(self, lab):
-        """
-        正規化 LAB 到 [0, 1]
-        
-        Args:
-            lab: (H, W, 3) numpy array
-                 L: [0, 100]
-                 a: [-128, 127]
-                 b: [-128, 127]
-        
-        Returns:
-            lab_normalized: (H, W, 3) [0, 1]
-        """
+     
         lab_normalized = np.zeros_like(lab, dtype=np.float32)
         
         # L: [0, 100] → [0, 1]
@@ -245,7 +211,7 @@ class ColorCorrectionCNN:
                 return 'whitish'
         
         # 判斷色偏類型（基於 a, b 通道）
-        threshold = 3.0  # LAB 空間的閾值
+        threshold = 2.5  # LAB 空間的閾值
         
         if abs(mean_a) < threshold and abs(mean_b) < threshold:
             return 'no_cast'
@@ -330,7 +296,7 @@ class ColorCorrectionTrainer:
         color_loss = self._lab_color_consistency_loss(output_lab, target_lab)
         
         # 總損失
-        total_loss = 0.3 * l1_loss + 0.3 * color_loss + 0.4 * ssim_loss
+        total_loss = 0.3 * l1_loss + 0.7 * ssim_loss
         
         # 反向傳播
         self.optimizer.zero_grad()
