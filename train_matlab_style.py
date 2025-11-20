@@ -60,7 +60,11 @@ class MATLABStyleDataset(Dataset):
         
         # 大氣光估算器
         self.atmos_estimator = AtmosphericLightEstimator(min_size=1)
-        
+        self.atmos_estimator = AtmosphericLightCNN(
+            model_path=r"D:\research\better_one\color_type\airlight_data\best_atmospheric_light_model.pth",
+            device='cuda',
+            base_channels=16
+        )
         # 找到所有圖像
         self.image_paths = (
             list(self.image_folder.glob('*.jpg')) + 
