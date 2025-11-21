@@ -15,7 +15,7 @@ import torchvision.transforms as T
 import logging
 from datetime import datetime
 logger = logging.getLogger("MATLABStylePredictor")
-
+from airlight_CNN import AtmosphericLightCNN
 # 導入模組
 from color_correction import ColorCorrection
 from matlab_style_enhancement import AtmosphericLightEstimator, MATLABStyleEnhancement
@@ -30,9 +30,9 @@ class MATLABStylePredictor:
         self.device = device if (device == 'cuda' and torch.cuda.is_available()) else 'cpu'
         self.input_size = input_size
         
-        logger.info(f"載入模型: {model_path}  (device={self.device})")
+        logger.info(f"Loading model: {model_path}  (device={self.device})")
         
-        # 載入參數預測器
+        
         self.param_predictor = MATLABParameterPredictor(
             pretrained=False, 
             hidden_dim=256, 
@@ -43,14 +43,17 @@ class MATLABStylePredictor:
         state = ckpt.get('model_state_dict', ckpt)
         self.param_predictor.load_state_dict(state)
         self.param_predictor.to(self.device).eval()
-        
-        # 載入增強模組
         self.enhancement = MATLABStyleEnhancement().to(self.device).eval()
         
-        # 預處理模組
-        self.color_corrector = ColorCorrection()
-        self.color_corrector = ColorCorrectionCNN(model_path='D:\research\better_one\color_correction_output\best_color_correction_model.pth', device='cuda')
-        self.atmos_estimator = AtmosphericLightEstimator(min_size=1)
+        # self.color_corrector = ColorCorrection()
+        self.color_corrector = ColorCorrectionCNN(model_path='D:\research\better_one\color_correction_cnn_model\best_color_correction_model.pth', device='cuda')
+        # self.atmos_estimator = AtmosphericLightEstimator(min_size=1)
+        logger.info(f"Loading airlight model: {model_path}  (device={self.device})")
+        self.atmos_estimator = AtmosphericLightCNN(
+            model_path="D:\research\better_one\airlight_cnn_model\best_atmospheric_light_model.pth",
+            device=self.device,
+            base_channels=16
+        )
         
         # VGG 歸一化
         self.normalize = T.Normalize(
@@ -61,18 +64,7 @@ class MATLABStylePredictor:
         logger.info("✓ 模型與增強模組已載入")
     
     def preprocess(self, img):
-        """
-        預處理：色偏校正 + 大氣光估算
-        
-        Args:
-            img: (H, W, 3) RGB [0, 1]
-        
-        Returns:
-            img_corrected: (H, W, 3) RGB [0, 1]
-            atmospheric_light: (3,) numpy array
-            color_type: str
-        """
-        # 色偏校正
+     
         img_corrected, color_type = self.color_corrector(img)
         
         # 大氣光估算
@@ -156,15 +148,15 @@ class MATLABStylePredictor:
         params = self.predict_parameters(img_corrected, features)
         
         if show_params:
-            logger.info("  預測的參數:")
+            logger.info("  parameters:")
             for k, v in params.items():
                 logger.info(f"    {k}: {v.item():.4f}")
         
-        # 增強圖像
+        # Enhance image
         
         enhanced = self.enhance_image(img_corrected, atmospheric_light, params)
         
-        # 保存結果
+        # Save result
         if output_path is None:
             output_path = input_path.parent / f"{input_path.stem}_enhanced.png"
         else:
@@ -195,10 +187,10 @@ class MATLABStylePredictor:
         )
         
         if not image_files:
-            logger.warning("找不到任何影像檔案！")
+            logger.warning("No image files found!")
             return
         
-        logger.info(f"\n找到 {len(image_files)} 張圖像")
+        logger.info(f"\nFound {len(image_files)} images")
         
         for i, img_path in enumerate(image_files, 1):
             logger.info(f"\n[{i}/{len(image_files)}] 處理: {img_path.name}")
@@ -211,7 +203,7 @@ class MATLABStylePredictor:
                      show_params=show_params
                  )
             except Exception as e:
-                 logger.error(f"  ✗ 失敗: {e}", exc_info=True)
+                 logger.error(f"  ✗  Failed: {e}", exc_info=True)
         
 
 # ============================================
@@ -220,7 +212,7 @@ class MATLABStylePredictor:
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='MATLAB 風格水下影像增強推理'
+        description='MATLAB style underwater image enhancement inference'
     )
     
     parser.add_argument('--input', type=str, required=True, 
@@ -234,7 +226,7 @@ if __name__ == '__main__':
     
     args = parser.parse_args()
     
-    # 設定 logging：輸出到 console 與 output folder 下的 log 檔
+    # Set up logging: output to console and a log file in the output folder
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)

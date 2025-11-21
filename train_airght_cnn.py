@@ -8,6 +8,9 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 import json
+# 確保導入 numpy 和 cv2
+import numpy as np
+import cv2
 
 from airlight_CNN import LightweightAtmosphericLightNet, AtmosphericLightTrainer
 
@@ -277,8 +280,27 @@ def train_atmospheric_light_model(args):
             best_val_loss = avg_val_loss
             patience_counter = 0
             best_model_path = output_dir / 'best_atmospheric_light_model.pth'
-            trainer.save_checkpoint(best_model_path, epoch, avg_val_loss)
-            print(f"✓ 新的最佳模型! Val Loss: {best_val_loss:.6f}")
+            
+            # --- 修改開始 ---
+            try:
+                # 確保目錄存在 (雙重保險)
+                output_dir.mkdir(parents=True, exist_ok=True)
+                
+                # 嘗試存檔
+                trainer.save_checkpoint(best_model_path, epoch, avg_val_loss)
+                print(f"✓ 新的最佳模型! Val Loss: {best_val_loss:.6f}")
+                
+            except Exception as e:
+                print(f"⚠ 警告: 無法寫入 {best_model_path.name}，錯誤: {e}")
+                # 備案：換個名字存存看，避免訓練崩潰
+                fallback_path = output_dir / f'best_model_fallback_epoch_{epoch}.pth'
+                try:
+                    trainer.save_checkpoint(fallback_path, epoch, avg_val_loss)
+                    print(f"✓ 已改為儲存至備用路徑: {fallback_path.name}")
+                except Exception as e2:
+                    print(f"❌ 嚴重錯誤: 備用路徑也無法寫入: {e2}")
+            # --- 修改結束 ---
+            
         else:
             patience_counter += 1
             print(f"Patience: {patience_counter}/{max_patience}")
@@ -312,15 +334,144 @@ def train_atmospheric_light_model(args):
     print("=" * 80)
 
 
+# ============================================
+# 新增：Quadtree 大氣光估算器 
+# ============================================
+
+class QuadtreeAirlightEstimator:
+    def __init__(self, min_size=32):
+        self.min_size = min_size
+
+    def _get_brightest_pixel(self, block):
+        """找到區塊中最亮的像素 (Sum of RGB)"""
+        # block shape: (H, W, 3)
+        pixel_sum = np.sum(block, axis=2) # (H, W)
+        idx = np.argmax(pixel_sum)
+        # unravel_index 將平坦索引轉回 (row, col)
+        row, col = np.unravel_index(idx, pixel_sum.shape)
+        return block[row, col, :]
+
+    def _compute_Q(self, block):
+        """計算區塊的品質指標 Q"""
+        h, w, c = block.shape
+        n = h * w
+        
+        if n == 0: return -np.inf
+
+        I_r = block[:, :, 0]
+        I_g = block[:, :, 1]
+        I_b = block[:, :, 2]
+
+        # 第一項：亮度平均
+        term1 = (np.sum(I_r) + np.sum(I_g) + np.sum(I_b)) / (3 * n)
+
+        # 第二項：色彩對比項 (Blue + Green - 2*Red)
+        # 水下圖像通常藍綠強，紅弱。此項鼓勵選取背景水體。
+        term2 = (np.sum(I_b) + np.sum(I_g) - 2 * np.sum(I_r)) / n
+
+        # 第三項：色彩變異項 (希望選取平滑區域)
+        var_r = np.var(I_r)
+        var_g = np.var(I_g)
+        var_b = np.var(I_b)
+        term3 = (var_r + var_g + var_b) / 3
+
+        # 第四項：邊緣數量 (希望避開物體紋理)
+        # 轉灰階 (簡單加權)
+        gray = 0.299 * I_r + 0.587 * I_g + 0.114 * I_b
+        
+        # Sobel 邊緣檢測
+        # 注意：輸入是 float [0,1]，Sobel 輸出也是 float
+        sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        magnitude = np.sqrt(sobelx**2 + sobely**2)
+        
+        # 設定閾值判斷邊緣 (這裡設 0.1，可根據實際數據調整)
+        edge_map = magnitude > 0.1
+        edge_density = np.sum(edge_map) / n
+        term4 = edge_density
+
+        # 合成 Q
+        Q = term1 + term2 - term3 - term4
+        return Q
+
+    def __call__(self, img):
+        """
+        執行 Quadtree 搜索
+        img: float32 numpy array [0, 1], shape (H, W, 3), RGB order
+        """
+        n_rows, n_cols, _ = img.shape
+        
+        max_Q = -np.inf
+        max_RGB = np.array([0.0, 0.0, 0.0])
+        
+        # 初始區塊
+        current_block = img
+        
+        # 模擬遞迴/堆疊過程 (這裡使用貪婪策略，每次往 Q 最大的子區塊走)
+        while True:
+            h, w, _ = current_block.shape
+            
+            # 計算當前區塊 Q 值 (雖然 MATLAB 代碼是在分割後算，但這裡作為基準)
+            # 為了完全符合您的 MATLAB 邏輯，我們主要在分割後計算
+            
+            # 如果小於最小尺寸，停止分割，取當前最亮點
+            if h <= self.min_size or w <= self.min_size:
+                # 這裡可以選擇計算最後小區塊的 Q，或者直接結束
+                # 根據 MATLAB 邏輯，這裡不再分割
+                break
+
+            # 分割
+            mid_row = h // 2
+            mid_col = w // 2
+            
+            # 四個子區塊
+            b1 = current_block[0:mid_row, 0:mid_col, :]
+            b2 = current_block[0:mid_row, mid_col:w, :]
+            b3 = current_block[mid_row:h, 0:mid_col, :]
+            b4 = current_block[mid_row:h, mid_col:w, :]
+            
+            # 計算四個區域的 Q 值
+            q1 = self._compute_Q(b1)
+            q2 = self._compute_Q(b2)
+            q3 = self._compute_Q(b3)
+            q4 = self._compute_Q(b4)
+            
+            qs = [q1, q2, q3, q4]
+            blocks = [b1, b2, b3, b4]
+            
+            # 找到 Q 值最大的區域
+            best_idx = np.argmax(qs)
+            block_max_q = qs[best_idx]
+            best_block = blocks[best_idx]
+            
+            # 獲取該最佳區塊內的最亮像素
+            block_max_rgb = self._get_brightest_pixel(best_block)
+            
+            # 更新全局最大值
+            if block_max_q > max_Q:
+                max_Q = block_max_q
+                max_RGB = block_max_rgb
+            
+            # 進入下一層 (貪婪搜索：只進入 Q 最大的那個區塊)
+            current_block = best_block
+            
+        return max_RGB
+
+
+# ============================================
+# 修改 generate_sample_labels 函數
+# ============================================
+
 def generate_sample_labels(args):
     """
-    生成範例標籤文件（使用傳統方法估計大氣光）
+    生成範例標籤文件（使用 Quadtree 方法估計大氣光）
     """
     print("=" * 80)
-    print("生成範例標籤文件")
+    print("生成範例標籤文件 (Quadtree Method)")
     print("=" * 80)
     
-    from matlab_style_enhancement import AtmosphericLightEstimator
+    # 移除舊的導入
+    # from matlab_style_enhancement import AtmosphericLightEstimator
     
     image_dir = Path(args.images)
     output_file = Path(args.output) / 'atmospheric_light_labels.txt'
@@ -338,8 +489,8 @@ def generate_sample_labels(args):
         print("⚠ 錯誤: 沒有找到圖像文件")
         return
     
-    # 使用傳統方法估計大氣光
-    estimator = AtmosphericLightEstimator(min_size=1)
+    # 使用新的 Quadtree 估算器
+    estimator = QuadtreeAirlightEstimator(min_size=32) # min_size 可調整
     
     labels = []
     for img_path in tqdm(image_files, desc='估計大氣光'):
@@ -348,10 +499,17 @@ def generate_sample_labels(args):
             print(f"⚠ 跳過無法讀取的圖像: {img_path}")
             continue
         
+        # 轉 RGB 並歸一化到 [0, 1]
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        atmos = estimator(img_rgb)
         
-        labels.append(f"{img_path.name} {atmos[0]:.6f} {atmos[1]:.6f} {atmos[2]:.6f}\n")
+        # 執行估算
+        try:
+            atmos = estimator(img_rgb)
+            # 寫入格式: 檔名 R G B
+            labels.append(f"{img_path.name} {atmos[0]:.6f} {atmos[1]:.6f} {atmos[2]:.6f}\n")
+        except Exception as e:
+            print(f"⚠ 處理 {img_path.name} 時發生錯誤: {e}")
+            continue
     
     # 保存標籤
     output_file.parent.mkdir(parents=True, exist_ok=True)

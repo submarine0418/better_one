@@ -24,8 +24,101 @@ import torch.nn.functional as F
 from color_correction import ColorCorrection
 from matlab_style_enhancement import AtmosphericLightEstimator, MATLABStyleEnhancement
 from parameter_predictor import MATLABParameterPredictor
-from color_correction_cnn import ColorCorrectionCNN
-from airlight_CNN import make_atmospheric_light_cnn  
+
+# 修改這兩行導入，加入底層網路類別
+from color_correction_cnn import ColorCorrectionCNN, LightweightColorCorrectionNet
+from airlight_CNN import make_atmospheric_light_cnn, LightweightAtmosphericLightNet
+
+# ============================================
+# GPU 色彩轉換工具 (移到這裡)
+# ============================================
+
+class RGB2Lab_GPU(nn.Module):
+    """
+    PyTorch GPU 版 RGB -> LAB (符合您模型的正規化標準)
+    輸入: (B, 3, H, W) RGB [0, 1]
+    輸出: (B, 3, H, W) LAB Normalized (L:0-1, a:0-1, b:0-1)
+    """
+    def __init__(self):
+        super().__init__()
+        self.register_buffer('matrix_srgb2xyz', torch.tensor([
+            [0.4124564, 0.3575761, 0.1804375],
+            [0.2126729, 0.7151522, 0.0721750],
+            [0.0193339, 0.1191920, 0.9503041]
+        ], dtype=torch.float32))
+        self.register_buffer('d65', torch.tensor([0.95047, 1.00000, 1.08883], dtype=torch.float32))
+
+    def f_func(self, t):
+        mask = t > 0.008856
+        return torch.where(mask, torch.pow(t, 1/3), 7.787 * t + 16/116)
+
+    def forward(self, rgb):
+        # 1. Inverse sRGB Gamma
+        mask = rgb > 0.04045
+        rgb_linear = torch.where(mask, torch.pow((rgb + 0.055) / 1.055, 2.4), rgb / 12.92)
+        
+        # 2. RGB -> XYZ
+        xyz = torch.matmul(rgb_linear.permute(0, 2, 3, 1), self.matrix_srgb2xyz.t())
+        xyz = xyz / self.d65
+        
+        # 3. XYZ -> LAB
+        xyz_f = self.f_func(xyz)
+        L = 116 * xyz_f[..., 1] - 16
+        a = 500 * (xyz_f[..., 0] - xyz_f[..., 1])
+        b = 200 * (xyz_f[..., 1] - xyz_f[..., 2])
+        
+        # 4. Normalize (符合您原本 Dataset 的邏輯)
+        # L: 0-100 -> 0-1
+        L_norm = L / 100.0
+        # a, b: -128~127 -> 0-1
+        a_norm = (a + 128.0) / 255.0
+        b_norm = (b + 128.0) / 255.0
+        
+        return torch.stack([L_norm, a_norm, b_norm], dim=-1).permute(0, 3, 1, 2)
+
+class Lab2RGB_GPU(nn.Module):
+    """
+    PyTorch GPU 版 LAB -> RGB
+    輸入: (B, 3, H, W) LAB Normalized
+    輸出: (B, 3, H, W) RGB [0, 1]
+    """
+    def __init__(self):
+        super().__init__()
+        self.register_buffer('matrix_xyz2srgb', torch.tensor([
+            [3.2404542, -1.5371385, -0.4985314],
+            [-0.9692660, 1.8760108, 0.0415560],
+            [0.0556434, -0.2040259, 1.0572252]
+        ], dtype=torch.float32))
+        self.register_buffer('d65', torch.tensor([0.95047, 1.00000, 1.08883], dtype=torch.float32))
+
+    def forward(self, lab_norm):
+        # 1. Denormalize
+        L = lab_norm[:, 0, :, :] * 100.0
+        a = lab_norm[:, 1, :, :] * 255.0 - 128.0
+        b = lab_norm[:, 2, :, :] * 255.0 - 128.0
+        
+        # 2. LAB -> XYZ
+        fy = (L + 16) / 116
+        fx = a / 500 + fy
+        fz = fy - b / 200
+        
+        fx3, fy3, fz3 = fx**3, fy**3, fz**3
+        
+        x = torch.where(fx3 > 0.008856, fx3, (fx - 16/116) / 7.787)
+        y = torch.where(L > 8, fy3, L / 903.3)
+        z = torch.where(fz3 > 0.008856, fz3, (fz - 16/116) / 7.787)
+        
+        xyz = torch.stack([x, y, z], dim=-1) * self.d65
+        
+        # 3. XYZ -> RGB
+        rgb_linear = torch.matmul(xyz, self.matrix_xyz2srgb.t())
+        
+        # 4. Gamma Correction
+        mask = rgb_linear > 0.0031308
+        rgb = torch.where(mask, 1.055 * torch.pow(rgb_linear, 1/2.4) - 0.055, 12.92 * rgb_linear)
+        
+        return torch.clamp(rgb.permute(0, 3, 1, 2), 0, 1)
+
 # ============================================
 # 數據集（帶預處理）
 # ============================================
@@ -36,41 +129,21 @@ class MATLABStyleDataset(Dataset):
     """
     
     def __init__(self, image_folder, reference_folder, target_size=224, 
-                 augment=True, use_features=False):
+                 augment=True):
         """
         Args:
             image_folder: 輸入圖像資料夾
             reference_folder: 參考圖像資料夾
             target_size: 目標大小
             augment: 是否數據增強
-            use_features: 是否使用統計特徵
-            atmos_model_path: 大氣光模型路徑
         """
         self.image_folder = Path(image_folder)
         self.reference_folder = Path(reference_folder)
         self.target_size = target_size
         self.augment = augment
-        self.use_features = use_features
         
-        # 色偏校正器
-        self.color_corrector = ColorCorrectionCNN(
-            model_path=r"D:\research\better_one\color_correction_output\best_color_correction_model.pth",
-            device='cuda'
-        )
-        
-        # 大氣光估算器
-        self.atmos_estimator = AtmosphericLightEstimator(min_size=1)
-        self.atmos_estimator = AtmosphericLightCNN(
-            model_path=r"D:\research\better_one\color_type\airlight_data\best_atmospheric_light_model.pth",
-            device='cuda',
-            base_channels=16
-        )
         # 找到所有圖像
-        self.image_paths = (
-            list(self.image_folder.glob('*.jpg')) + 
-            list(self.image_folder.glob('*.png')) +
-            list(self.image_folder.glob('*.jpeg'))
-        )
+        self.image_paths = list(self.image_folder.glob('*.*')) # 簡化寫法
         
         if len(self.image_paths) == 0:
             raise ValueError(f"No images found in {image_folder}")
@@ -113,72 +186,37 @@ class MATLABStyleDataset(Dataset):
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
         
-        # Load original image (no resizing, used for color correction and airlight estimation)
-        img_original_cv = cv2.imread(str(img_path))
-        if img_original_cv is None:
-            raise ValueError(f"Failed to load image: {img_path}")
-        img_original_cv = cv2.cvtColor(img_original_cv, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        # 1. 只讀取原始圖像 (Raw Image)
+        img = cv2.imread(str(img_path))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, (self.target_size, self.target_size))
+        img = img.astype(np.float32) / 255.0
         
-      
-        
-        # 1. color correction
-        img_corrected, color_type = self.color_corrector(img_original_cv)
-        
-        # 2. airlight
-        atmospheric_light = self.atmos_estimator(img_corrected)
-
-        # Resize corrected image to target size
-        img_corrected_resized = cv2.resize(
-            (img_corrected * 255).astype(np.uint8), 
-            (self.target_size, self.target_size),
-            interpolation=cv2.INTER_LINEAR
-        ).astype(np.float32) / 255.0
-        
-        # Load reference image
+        # 2. 讀取參考圖像
         ref_path = self.reference_folder / img_path.name
         if ref_path.exists():
-            ref = self.load_image(ref_path, self.target_size)
+            ref = cv2.imread(str(ref_path))
+            ref = cv2.cvtColor(ref, cv2.COLOR_BGR2RGB)
+            ref = cv2.resize(ref, (self.target_size, self.target_size))
+            ref = ref.astype(np.float32) / 255.0
         else:
-            # If no reference image, use original image
-            ref = cv2.resize(img_original_cv, (self.target_size, self.target_size),
-                           interpolation=cv2.INTER_LINEAR)
-        
-        # ========================================
-        # Data augmentation
-        # ========================================
+            ref = img.copy() # Fallback
+            
+        # 3. 數據增強
         if self.augment:
-            img_corrected_resized, ref = self.augment_pair(img_corrected_resized, ref)
+            if np.random.rand() > 0.5:
+                img = np.fliplr(img).copy(); ref = np.fliplr(ref).copy()
+            if np.random.rand() > 0.5:
+                img = np.flipud(img).copy(); ref = np.flipud(ref).copy()
         
-        # ========================================
-        # Convert to Tensor
-        # ========================================
-        
-        # 1. Image for augmentation (original scale)
-        img_tensor = torch.from_numpy(img_corrected_resized).permute(2, 0, 1).float()
-        
-        # 2. Image for VGG (VGG normalization)
-        img_vgg = self.normalize(img_tensor.clone())
-        
-        # 3. Reference image 
+        # 4. 轉 Tensor
+        img_tensor = torch.from_numpy(img).permute(2, 0, 1).float()
         ref_tensor = torch.from_numpy(ref).permute(2, 0, 1).float()
         
-        # 4. Atmospheric light
-        atmos_tensor = torch.from_numpy(atmospheric_light).float()
-        
-        # 5. Statistical features(no use)
-        # if self.use_features:
-        #     features = extract_statistical_features(img_corrected_resized)
-        #     feature_tensor = torch.from_numpy(features).float()
-        # else:
-        feature_tensor = torch.zeros(79).float()
         
         return {
-            'image': img_tensor,              # (3, H, W) for augmentation, [0, 1]
-            'image_vgg': img_vgg,             # (3, H, W) for VGG, normalized
-            'reference': ref_tensor,          # (3, H, W) reference image
-            'atmospheric_light': atmos_tensor,  # (3,) atmospheric light
-            'features': feature_tensor,       # (79,) statistical features
-            'color_type': color_type,         # str color bias type
+            'image': img_tensor,      # Raw RGB
+            'reference': ref_tensor,  # GT RGB
             'path': str(img_path)
         }
 
@@ -313,41 +351,55 @@ class PerceptualLoss(nn.Module):
 
         
 class FullSSIMCombinedLoss(nn.Module):
-    """
-     SSIM + L1 
-    """
-    def __init__(self, ssim_weight=0.8, l1_weight=0.2, device='cuda'):
+    def __init__(self, ssim_weight=0.8, l1_weight=0.2, ab_reg_weight=0.05): # 新增權重參數
         super().__init__()
+        self.ssim_module = SSIMLoss()
+        self.l1_module = nn.L1Loss()
         self.ssim_weight = ssim_weight
         self.l1_weight = l1_weight
-        # self.perceptual_weight = perceptual_weight
+        self.ab_reg_weight = ab_reg_weight # 設定權重 (例如 0.05)
         
-        self.ssim_loss = SSIMLoss()
-        self.l1_loss = nn.L1Loss()
-        # self.perceptual_loss = PerceptualLoss(device)
-    
+        # 載入 GPU 版 LAB 轉換器 (用於計算 Loss)
+        self.rgb2lab = RGB2Lab_GPU() 
+
     def forward(self, enhanced, reference):
-        ssim = self.ssim_loss(enhanced, reference)
-        l1 = self.l1_loss(enhanced, reference)
-        # perceptual = self.perceptual_loss(enhanced, reference)
+        # 1. 原有的 Loss
+        ssim_loss = self.ssim_module(enhanced, reference)
+        l1_loss = self.l1_module(enhanced, reference)
         
-        total_loss = (self.ssim_weight * ssim + 
-                     self.l1_weight * l1  
-                     )
+        # 2. 新增：AB 通道約束 (防止色偏)
+        # 先把增強後的圖轉成 LAB
+        lab_enhanced = self.rgb2lab(enhanced) 
         
-        return total_loss, {
-            'ssim': ssim.item(),
-            'l1': l1.item(),
-            
-        }
+        # 取出 a, b 通道 (L是第0個, a是第1個, b是第2個)
+        # lab_enhanced shape: [Batch, 3, H, W]
+        a_channel = lab_enhanced[:, 1, :, :]
+        b_channel = lab_enhanced[:, 2, :, :]
+        
+        # 計算 AB 的平均絕對值 (L1) 或 平方和 (L2)
+        # 這裡假設我們希望色彩不要太誇張，所以懲罰過大的絕對值
+        # 或者，更進階一點：懲罰 "增強圖" 與 "參考圖" 之間 AB 通道的差異
+        
+        # 方法 A: 單純限制飽和度 (防止變成霓虹燈)
+        # ab_reg_loss = torch.mean(torch.abs(a_channel)) + torch.mean(torch.abs(b_channel))
+        
+        # 方法 B (推薦): 確保色調跟 Reference 接近
+        lab_ref = self.rgb2lab(reference)
+        ab_diff = torch.abs(lab_enhanced[:, 1:] - lab_ref[:, 1:]) # 只看 a, b 通道差異
+        ab_reg_loss = torch.mean(ab_diff)
+
+        # 總 Loss
+        total_loss = (self.ssim_weight * ssim_loss + 
+                      self.l1_weight * l1_loss + 
+                      self.ab_reg_weight * ab_reg_loss)
+                      
+        return total_loss, {'ssim': ssim_loss.item(), 'l1': l1_loss.item(), 'ab_reg': ab_reg_loss.item()}
 
 # ============================================
 # Trainer
 # ============================================
 
 class MATLABStyleTrainer:
-   
-    
     def __init__(self, device='cuda', use_amp=True):
         """
         Args:
@@ -357,6 +409,25 @@ class MATLABStyleTrainer:
         self.device = device
         self.use_amp = use_amp and (device == 'cuda')
         
+        # 1. 載入預處理模型 (Color Correction)
+        self.color_net = LightweightColorCorrectionNet(base_channels=16).to(device)
+        ckpt_color = torch.load(r"D:\research\better_one\color_correction_cnn_model\best_color_correction_model.pth", map_location=device)
+        self.color_net.load_state_dict(ckpt_color['model_state_dict'])
+        self.color_net.eval() # 凍結
+        for p in self.color_net.parameters(): p.requires_grad = False
+        
+        # 2. 載入預處理模型 (Airlight)
+        self.airlight_net = LightweightAtmosphericLightNet(base_channels=16).to(device)
+        ckpt_air = torch.load(r"D:\research\better_one\airlight_cnn_model\best_atmospheric_light_model.pth", map_location=device)
+        self.airlight_net.load_state_dict(ckpt_air['model_state_dict'])
+        self.airlight_net.eval() # 凍結
+        for p in self.airlight_net.parameters(): p.requires_grad = False
+        
+        # 3. GPU 轉換工具
+        self.rgb2lab = RGB2Lab_GPU().to(device)
+        self.lab2rgb = Lab2RGB_GPU().to(device)
+        self.vgg_norm = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        
         # 初始化模型
         self.param_predictor = MATLABParameterPredictor(
             pretrained=True, 
@@ -365,7 +436,9 @@ class MATLABStyleTrainer:
         ).to(device)
         
         self.enhancement = MATLABStyleEnhancement().to(device)
-        self.criterion = FullSSIMCombinedLoss(device=device)
+        
+        # 修改這裡：移除 device=device
+        self.criterion = FullSSIMCombinedLoss().to(device) 
         
         # Optimizer
         self.optimizer = optim.AdamW(
@@ -395,28 +468,47 @@ class MATLABStyleTrainer:
         self.enhancement.eval()  # Enhancement module not trained
         
         total_loss = 0
-        loss_components = {'ssim': 0, 'l1': 0}
+        # 修改這裡：加入 'ab_reg': 0
+        loss_components = {'ssim': 0, 'l1': 0, 'ab_reg': 0} 
         
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
         
         for batch_idx, batch in enumerate(pbar):
-            # Get data
-            images = batch['image'].to(self.device)               # (B, 3, H, W)
-            images_vgg = batch['image_vgg'].to(self.device)       # (B, 3, H, W)
-            references = batch['reference'].to(self.device)       # (B, 3, H, W)
-            atmos_light = batch['atmospheric_light'].to(self.device)  # (B, 3)
-            features = batch['features'].to(self.device)          # (B, 79)
+            # 1. 獲取原始圖像 (Raw RGB)
+            raw_images = batch['image'].to(self.device)
+            references = batch['reference'].to(self.device)
+            
+            # 2. 在 GPU 上進行預處理 (極快)
+            with torch.no_grad():
+                # RGB -> LAB
+                lab_images = self.rgb2lab(raw_images)
+                
+                # 色彩校正 (LAB -> LAB)
+                corrected_lab = self.color_net(lab_images)
+                
+                # LAB -> RGB (得到校正後的 RGB)
+                corrected_rgb = self.lab2rgb(corrected_lab)
+                
+                # 大氣光估算 (輸入校正後的 RGB)
+                atmos_light = self.airlight_net(corrected_rgb)
+                
+                # VGG Normalize (給參數預測網路用)
+                images_vgg = self.vgg_norm(corrected_rgb)
+
+            # 3. 準備 Features (因為 use_features=False，我們給一個全 0 的 Tensor 即可)
+            # 尺寸: (Batch_Size, 79)
+            features = torch.zeros(raw_images.size(0), 79, device=self.device)
             
             self.optimizer.zero_grad()
             
             # Mixed precision training
             if self.use_amp:
                 with torch.amp.autocast('cuda'):
-                    # Predict parameters
+                    # Predict parameters (使用校正後的圖)
                     params = self.param_predictor(images_vgg, features)
                     
-                    # Apply enhancement
-                    enhanced, _ = self.enhancement(images, params, atmos_light)
+                    # Apply enhancement (注意：這裡要傳入 corrected_rgb，因為原本 Dataset 回傳的就是校正後的圖)
+                    enhanced, _ = self.enhancement(corrected_rgb, params, atmos_light)
                     
                     # Calculate loss
                     loss, components = self.criterion(enhanced, references)
@@ -429,7 +521,7 @@ class MATLABStyleTrainer:
             else:
                 # Standard training
                 params = self.param_predictor(images_vgg, features)
-                enhanced, _ = self.enhancement(images, params, atmos_light)
+                enhanced, _ = self.enhancement(corrected_rgb, params, atmos_light)
                 loss, components = self.criterion(enhanced, references)
                 
                 loss.backward()
@@ -449,7 +541,7 @@ class MATLABStyleTrainer:
         
         avg_loss = total_loss / len(dataloader)
         avg_components = {k: v / len(dataloader) for k, v in loss_components.items()}
-        print(f"Batch images device: {images.device}")  # 必須是 cuda:0
+        # print(f"Batch images device: {raw_images.device}") 
         self.train_losses.append(avg_loss)
         return avg_loss, avg_components
     
@@ -459,18 +551,26 @@ class MATLABStyleTrainer:
         self.enhancement.eval()
         
         total_loss = 0
-        loss_components = {'ssim': 0, 'l1': 0}
+        # 修改這裡：加入 'ab_reg': 0
+        loss_components = {'ssim': 0, 'l1': 0, 'ab_reg': 0}
         
         with torch.no_grad():
             for batch in tqdm(dataloader, desc="Validating"):
-                images = batch['image'].to(self.device)
-                images_vgg = batch['image_vgg'].to(self.device)
+                # 1. 獲取數據
+                raw_images = batch['image'].to(self.device)
                 references = batch['reference'].to(self.device)
-                atmos_light = batch['atmospheric_light'].to(self.device)
-                features = batch['features'].to(self.device)
                 
+                # 2. GPU 預處理 (與訓練時相同)
+                lab_images = self.rgb2lab(raw_images)
+                corrected_lab = self.color_net(lab_images)
+                corrected_rgb = self.lab2rgb(corrected_lab)
+                atmos_light = self.airlight_net(corrected_rgb)
+                images_vgg = self.vgg_norm(corrected_rgb)
+                features = torch.zeros(raw_images.size(0), 79, device=self.device)
+                
+                # 3. 推理
                 params = self.param_predictor(images_vgg, features)
-                enhanced, _ = self.enhancement(images, params, atmos_light)
+                enhanced, _ = self.enhancement(corrected_rgb, params, atmos_light)
                 loss, components = self.criterion(enhanced, references)
                 
                 total_loss += loss.item()
@@ -641,7 +741,7 @@ def train_matlab_style(image_folder, reference_folder, output_folder,
             print(f"\nTrain Loss: {train_loss:.6f}")
             print(f"  SSIM: {train_components['ssim']:.6f}, "
                   f"L1: {train_components['l1']:.6f}, "
-                #   f"Perceptual: {train_components['perceptual']:.6f}"
+                  f"AB_Reg: {train_components.get('ab_reg', 0):.6f}" # <--- 新增這行
                 )
             
             # 驗證
@@ -649,7 +749,7 @@ def train_matlab_style(image_folder, reference_folder, output_folder,
             print(f"Val Loss: {val_loss:.6f}")
             print(f"  SSIM: {val_components['ssim']:.6f}, "
                   f"L1: {val_components['l1']:.6f}, "
-                #   f"Perceptual: {val_components['perceptual']:.6f}"
+                  f"AB_Reg: {val_components.get('ab_reg', 0):.6f}" # <--- 新增這行
                   )
             
             # 更新學習率

@@ -287,15 +287,25 @@ def train_color_correction_model(args):
             # 前向傳播
             output_labs = trainer.model(input_labs)
             
-            # 損失函數（LAB 空間）
-            # L1 損失
-            l1_loss = trainer.l1_loss(output_labs, target_labs)
+            # --- 修改開始 ---
+            # 1. SSIM Loss (保持不變)
             ssim_loss = 1 - trainer.ssim(output_labs, target_labs, window=trainer.window, window_size=trainer.window_size, channel=3)
-            # LAB 空間的色彩一致性損失
-           
             
-            # 總損失
-            loss = 0.3 * l1_loss + 0.7 * ssim_loss
+            # 2. 拆解 LAB 通道計算 L1 Loss
+            # output_labs shape: [Batch, 3, H, W]
+            diff = torch.abs(output_labs - target_labs)
+            l_diff = diff[:, 0, :, :].mean() # 亮度差異
+            a_diff = diff[:, 1, :, :].mean() # 紅綠差異 (洋紅偏色主因)
+            b_diff = diff[:, 2, :, :].mean() # 黃藍差異
+            
+            # 3. 加權色彩 Loss (Weighted Color Loss)
+            # 給 a, b 通道 2 倍的權重，強迫模型修正色偏
+            weighted_l1_loss = l_diff + 2.0 * a_diff + 2.0 * b_diff
+            
+            # 4. 總 Loss 組合
+            # 降低 SSIM 權重，提高色彩權重
+            loss = 0.6 * weighted_l1_loss + 0.4 * ssim_loss
+            # --- 修改結束 ---
             
             # 反向傳播
             loss.backward()
@@ -323,11 +333,19 @@ def train_color_correction_model(args):
                 
                 output = model(input_labs)
                 
-                # 驗證損失（使用相同的損失組合）
-                l1_loss = F.l1_loss(output, target_labs)
-                color_loss = trainer._lab_color_consistency_loss(output, target_labs)
+                # --- 修改開始 ---
+                # 保持與訓練相同的 Loss 計算邏輯，才能正確評估
                 ssim_loss = 1 - trainer.ssim(output, target_labs, window=trainer.window, window_size=trainer.window_size, channel=3)
-                loss = 0.3 * l1_loss + 0.7 * ssim_loss
+                
+                diff = torch.abs(output - target_labs)
+                l_diff = diff[:, 0, :, :].mean()
+                a_diff = diff[:, 1, :, :].mean()
+                b_diff = diff[:, 2, :, :].mean()
+                
+                weighted_l1_loss = l_diff + 2.0 * a_diff + 2.0 * b_diff
+                
+                loss = 0.6 * weighted_l1_loss + 0.4 * ssim_loss
+                # --- 修改結束 ---
                 
                 val_loss += loss.item()
         

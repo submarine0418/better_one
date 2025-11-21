@@ -296,7 +296,7 @@ class ColorCorrectionTrainer:
         color_loss = self._lab_color_consistency_loss(output_lab, target_lab)
         
         # 總損失
-        total_loss = 0.3 * l1_loss + 0.7 * ssim_loss
+        total_loss = 0.2 * l1_loss + 0.8 * ssim_loss
         
         # 反向傳播
         self.optimizer.zero_grad()
